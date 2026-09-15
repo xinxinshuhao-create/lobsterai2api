@@ -2,6 +2,7 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -197,6 +198,10 @@ func prepareChatBody(rawBody []byte) []byte {
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、status 为上游状态码、err 为 nil（body 在 c.LastBody，
 // 调用方用 Classify(status, body) 判定）；只有传输层失败才返回 err。
+// ⚠️ 龙虾会把部分业务错误（如额度不足 code=40201）藏在 HTTP 200 的 SSE 流里
+//（event:error 帧），且帧在流首 → 对 200 响应先窥探首块，识别出错误帧就按
+// 非 2xx 同样路径处理（rc=nil + LastBody，由调用方 Classify），否则错误会
+// 假装成空 content 的正常响应穿透到客户端。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, err error) {
 	url := ServerBase() + "/api/proxy/v1/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepareChatBody(body)))
@@ -218,8 +223,73 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, nil
 	}
+	if peeked, sseErr := peekSSEError(resp.Body); sseErr != nil {
+		resp.Body.Close()
+		c.LastBody = peeked
+		kind := Classify(resp.StatusCode, string(peeked))
+		log.Printf("chat_stream uid=%s: upstream 200-with-error %s body=%s",
+			a.UID, kind, truncate(string(peeked), 200))
+		return nil, resp.StatusCode, nil
+	} else if peeked != nil {
+		// 首块已缓冲在 br 里，Peek 不消费 → 继续从 br 读即可无损透传。
+		return newPeekCloser(resp.Body), resp.StatusCode, nil
+	}
 	return resp.Body, resp.StatusCode, nil
 }
+
+// peekBufSize 首块窥探窗口：错误帧总在流首（实测 <200 字节），正常响应
+// 首 4KB 内必有数据；不足 4KB 且流已结束（EOF）也照样能判。
+const peekBufSize = 4 << 10
+
+// peekSSEError 对 200 的 SSE 流做首块窥探。返回值：
+//   - 命中错误帧 → (首块内容, err)；调用方应整条按错误处理。
+//   - 正常流     → (nil, nil)；首块留在内部 bufio 里，用 newPeekCloser 接续读。
+func peekSSEError(body io.Reader) ([]byte, error) {
+	br := bufio.NewReaderSize(body, peekBufSize)
+	head, err := br.Peek(peekBufSize)
+	if err != nil && err != io.EOF {
+		// 连接中途断开：按正常流放行，让下游读到半截时自行报传输错误。
+		return nil, nil
+	}
+	if len(head) == 0 {
+		return nil, nil
+	}
+	if isSSEErrorFrame(head) {
+		return head, fmt.Errorf("sse error frame in 200 stream")
+	}
+	return nil, nil
+}
+
+// isSSEErrorFrame 判定首块是否为龙虾 200 流内的错误帧：
+// `event:error` 行，或 data JSON 里带 error 对象 / 业务错误码。
+func isSSEErrorFrame(head []byte) bool {
+	s := string(head)
+	if strings.Contains(s, "event:error") || strings.Contains(s, "event: error") {
+		return true
+	}
+	if strings.Contains(s, "\"error\":{") || strings.Contains(s, "\"error\": {") {
+		return true
+	}
+	return false
+}
+
+// peekCloser：把窥探过的首块与原始 body 无损拼回一条读流。
+type peekCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func newPeekCloser(body io.ReadCloser) io.ReadCloser {
+	br := bufio.NewReaderSize(body, peekBufSize)
+	head, _ := br.Peek(peekBufSize) // peekSSEError 判过正常，这里必然有首块
+	return &peekCloser{
+		r: io.MultiReader(bytes.NewReader(head), br),
+		c: body,
+	}
+}
+
+func (p *peekCloser) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (p *peekCloser) Close() error               { return p.c.Close() }
 
 // FetchModels 调上游动态模型接口。
 // GET {server}/api/models/available，Bearer accessToken。
