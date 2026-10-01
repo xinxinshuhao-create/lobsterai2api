@@ -3,23 +3,74 @@ package upstream
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"lobsterai2api/internal/auth"
 )
 
+// clientVersion 只用于 User-Agent 字符串（与上游更新接口拉取的版本无关）。
+// 注意: client-activities/slot 会按 clientVersion 判断活动可见性 —— 旧版本号
+// （如 0.1.0）会被服务端返回 slotState=empty，签到前必须用 fetchClientVersion 取真实版本。
 const (
 	clientVersion = "0.1.0"
 	clientUA      = "LobsterAI/0.1.0"
+
+	// updateAPIURL 官方客户端更新接口，用于取当前线上版本号。
+	updateAPIURL = "https://api-overmind.youdao.com/openapi/get/luna/hardware/lobsterai/prod/update"
+	// fallbackClientVersion 更新接口不可用时的兜底版本号。
+	fallbackClientVersion = "2026.9.4"
+	// checkinPlacement 签到活动所在位置槽。
+	checkinPlacement = "desktop_sidebar"
 )
+
+// clientVersionCache 缓存从官方更新接口拉到的版本号（1h TTL，失败 10m 后重试）。
+var clientVersionCache struct {
+	sync.Mutex
+	val string
+	at  time.Time
+}
+
+// fetchClientVersion 取官方当前客户端版本号；失败返回 fallback。
+// 签到活动接口按版本号下发活动，旧版本会拿到 slotState=empty。
+func (c *Client) fetchClientVersion() string {
+	clientVersionCache.Lock()
+	defer clientVersionCache.Unlock()
+	if clientVersionCache.val != "" && time.Since(clientVersionCache.at) < time.Hour {
+		return clientVersionCache.val
+	}
+	v := fallbackClientVersion
+	if req, err := http.NewRequest(http.MethodGet, updateAPIURL, nil); err == nil {
+		req.Header.Set("Accept", "application/json")
+		if resp, err := c.HTTP.Do(req); err == nil {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			var env struct {
+				Data struct {
+					Value struct {
+						Version string `json:"version"`
+					} `json:"value"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(raw, &env) == nil && env.Data.Value.Version != "" {
+				v = env.Data.Value.Version
+			}
+		}
+	}
+	clientVersionCache.val = v
+	clientVersionCache.at = time.Now()
+	return v
+}
 
 // ServerBase returns the upstream API base URL from LB2A_UPSTREAM_BASE env.
 // No hardcoded domain — users must set this in their config or environment.
@@ -312,10 +363,138 @@ func (c *Client) QuotaUsage(a *auth.Auth) (remain int64, total int64, err error)
 	return 0, 0, fmt.Errorf("profile-summary: no credits")
 }
 
-// DailyCheckin 执行每日签到。目前龙虾签到端点未知，返回 nil（no-op）。
-// 后续抓包确定端点后再实现。
+// newUUID 生成随机 UUID4（幂等键用）。
+func newUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// checkinHeaders 设置 client-activities 请求头（Bearer + 真实客户端版本）。
+func checkinHeaders(req *http.Request, a *auth.Auth, version string) {
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "LobsterAI/"+version)
+}
+
+// activitySlot 是 slot 接口返回的活动描述。
+type activitySlot struct {
+	ActivityCode   string `json:"activityCode"`
+	ConfigRevision int    `json:"configRevision"`
+}
+
+// activityContext 是 context 接口返回的活动状态。
+type activityContext struct {
+	State struct {
+		ClaimedToday bool `json:"claimedToday"`
+	} `json:"state"`
+	Actions []string `json:"actions"`
+}
+
+// DailyCheckin 执行每日签到（+100 积分/号/天）。
+// 协议: GET slot → GET context → POST actions/check_in → 复核 claimedToday。
+// 幂等: 已签到 / 活动未投放 都返回 nil（不算失败），不会重复领取。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	// TODO: LobsterAI daily sign-in endpoint TBD
-	// placeholder: return nil means "checkin skipped silently"
+	base := ServerBase()
+	if base == "" {
+		return fmt.Errorf("checkin: LB2A_UPSTREAM_BASE not set")
+	}
+	version := c.fetchClientVersion()
+
+	// 1. 查活动槽：服务端按 clientVersion 决定活动可见性。
+	slotURL := fmt.Sprintf("%s/api/client-activities/slot?placement=%s&clientVersion=%s&containerApiVersion=2&platform=win32",
+		base, checkinPlacement, url.QueryEscape(version))
+	req, err := http.NewRequest(http.MethodGet, slotURL, nil)
+	if err != nil {
+		return err
+	}
+	checkinHeaders(req, a, version)
+	raw, err := c.doJSON(req)
+	if err != nil {
+		return err
+	}
+	var slot struct {
+		SlotState string        `json:"slotState"`
+		Activity  *activitySlot `json:"activity"`
+	}
+	if err := json.Unmarshal(raw, &slot); err != nil {
+		return fmt.Errorf("checkin slot parse: %w", err)
+	}
+	if slot.SlotState != "available" || slot.Activity == nil || slot.Activity.ActivityCode == "" {
+		log.Printf("checkin uid=%s: no activity (slotState=%q)", a.UID, slot.SlotState)
+		return nil
+	}
+	code, rev := slot.Activity.ActivityCode, slot.Activity.ConfigRevision
+
+	// 2. 查活动状态：已签到直接跳过。
+	ctxURL := fmt.Sprintf("%s/api/client-activities/%s/context?configRevision=%d", base, url.PathEscape(code), rev)
+	req, err = http.NewRequest(http.MethodGet, ctxURL, nil)
+	if err != nil {
+		return err
+	}
+	checkinHeaders(req, a, version)
+	raw, err = c.doJSON(req)
+	if err != nil {
+		return err
+	}
+	var ctx activityContext
+	if err := json.Unmarshal(raw, &ctx); err != nil {
+		return fmt.Errorf("checkin context parse: %w", err)
+	}
+	if ctx.State.ClaimedToday || !containsStr(ctx.Actions, "check_in") {
+		log.Printf("checkin uid=%s: already claimed today, skip", a.UID)
+		return nil
+	}
+
+	// 3. 提交签到（幂等键防止重复发放）。
+	body, _ := json.Marshal(map[string]any{
+		"configRevision": rev,
+		"idempotencyKey": newUUID(),
+		"payload":        map[string]any{},
+	})
+	actionURL := fmt.Sprintf("%s/api/client-activities/%s/actions/check_in", base, url.PathEscape(code))
+	req, err = http.NewRequest(http.MethodPost, actionURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	checkinHeaders(req, a, version)
+	req.Header.Set("Content-Type", "application/json")
+	raw, err = c.doJSON(req)
+	if err != nil {
+		return err
+	}
+	var res struct {
+		Result map[string]any `json:"result"`
+	}
+	_ = json.Unmarshal(raw, &res)
+	log.Printf("checkin uid=%s: claimed activity=%s reward=%v", a.UID, code, res.Result["rewardCredits"])
+
+	// 4. 复核：再拉一次 context，只有 claimedToday 真的翻转才算成功。
+	req, err = http.NewRequest(http.MethodGet, ctxURL, nil)
+	if err != nil {
+		return nil
+	}
+	checkinHeaders(req, a, version)
+	raw, err = c.doJSON(req)
+	if err != nil {
+		return nil
+	}
+	var after activityContext
+	if json.Unmarshal(raw, &after) == nil && !after.State.ClaimedToday {
+		return fmt.Errorf("checkin uid=%s: claimedToday still false after check_in", a.UID)
+	}
 	return nil
+}
+
+func containsStr(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
