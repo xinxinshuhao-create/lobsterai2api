@@ -42,6 +42,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					// 上游用 200 + SSE 错误帧表达失败（如未知模型 code=40300）。
+					// 不识别就会当成正常空流聚合出去，客户端只看到空白回复。
+					if ev, ok := chunk["error"].(map[string]any); ok {
+						return nil, errFromFrame(ev)
+					}
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -147,6 +152,24 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		resp["usage"] = usage
 	}
 	return resp, nil
+}
+
+// errFromFrame 把上游 SSE 错误帧转成带分类的 *Error，让调用方复用同一套冷却逻辑。
+// 帧形如 {"type":"proxy_error","message":"...","code":40300}。
+func errFromFrame(ev map[string]any) error {
+	msg, _ := ev["message"].(string)
+	if msg == "" {
+		msg, _ = ev["type"].(string)
+	}
+	// 帧内 code 是业务码，不是 HTTP 状态；分类仍走 Classify 的 body 关键词通道。
+	kind := Classify(0, msg)
+	if kind == ErrNone {
+		kind = ErrClient
+	}
+	if c, ok := ev["code"].(float64); ok {
+		msg = fmt.Sprintf("code=%d %s", int(c), msg)
+	}
+	return &Error{Kind: kind, Msg: msg}
 }
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：

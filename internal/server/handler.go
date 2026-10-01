@@ -250,6 +250,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := upstream.Aggregate(rc)
 		if err != nil {
+			// 上游 200 + SSE 错误帧（如未知模型）在此暴露。属请求侧问题，
+			// 不冷却账号、不换号，直接回 4xx 让调用方看到真实原因。
+			var ue *upstream.Error
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrClient {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", ue.Msg)
+				return
+			}
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}
