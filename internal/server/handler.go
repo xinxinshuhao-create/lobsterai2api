@@ -226,6 +226,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 非 2xx，或 200 但流首就是错误帧：统一用 LastBody 分类处置。
 			kind := upstream.Classify(status, string(h.cfg.Upstream.LastBody))
 			switch kind {
+			case upstream.ErrClient:
+				// 请求侧问题（未知模型等）：不冷却账号、不换号，
+				// 直接回 4xx 并带上游原因，避免退化成 no_healthy_account。
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+					truncateMsg(string(h.cfg.Upstream.LastBody)))
+				return
 			case upstream.ErrHardCredit:
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
@@ -297,4 +303,19 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// truncateMsg 压缩上游原始帧为单行短消息，供错误响应体使用。
+// 上游错误帧是多行 SSE，直接回传会带换行噪音；截断到首个有意义的错误文案。
+func truncateMsg(body string) string {
+	s := strings.Join(strings.Fields(body), " ")
+	if i := strings.Index(s, "\"message\":\""); i >= 0 {
+		if j := strings.Index(s[i+11:], "\""); j >= 0 {
+			return s[i+11 : i+11+j]
+		}
+	}
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
 }

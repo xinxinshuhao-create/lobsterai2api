@@ -92,5 +92,11 @@ func Classify(status int, body string) ErrKind {
 	if status >= 400 {
 		return ErrClient
 	}
+	if status == http.StatusOK {
+		// 到达此处说明调用方已判定响应体是错误帧（如未知模型 code=40300），
+		// 但未匹配任何已知 marker → 归为请求侧错误，由 handler 回 4xx，
+		// 不得落到 default 分支去轮转换号（会误伤健康账号并退化成 503）。
+		return ErrClient
+	}
 	return ErrNone
 }
