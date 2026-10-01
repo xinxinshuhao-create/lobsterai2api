@@ -94,13 +94,13 @@ See `config.example.json`. Environment variable prefix `LB2A_*`:
 - **Token refresh** — JWT expiry parsing, proactive refresh 10min before expiry, session death auto-disable
 - **Error classification** — hard credit cooldown 12h, 429 soft cooldown 60s, consecutive errors 3→10m, refresh rejected → disable
 - **Request-level rotation** — up to 3 account switches per request
-- **Scheduler** — daily checkin + credit refresh, token keepalive
+- **Scheduler** — daily check-in (+100 credits/account/day, idempotent) + credit refresh, token keepalive
 - **Dynamic model list** — fetched from upstream API, cached 1h, falls back to static table
 
 ## Known limitations / TODO
 
-- Daily checkin endpoint not yet identified, `DailyCheckin` is currently a no-op
-- Dynamic model list from upstream API (cached 1h, falls back to static table)
+- **Streaming errors cannot change status code** — once an SSE response has started, a mid-stream upstream error is passed through as an `event:error` frame rather than an HTTP 4xx. Non-streaming requests return 400 with the upstream reason.
+- **Upstream version probe** — the check-in flow reads the current client version from the official update API; if that probe fails it falls back to a built-in version constant, which the slot endpoint may treat as stale.
 
 ## License
 
