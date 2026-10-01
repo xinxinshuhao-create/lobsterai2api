@@ -57,6 +57,8 @@ var hardMarkers = []string{
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit", "freecreditsused", "free credits used",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分", "积分耗尽",
+	// 龙虾 200 流内错误帧（code 40201）实测文案：「免费额度已用完，请升级套餐」
+	"额度已用完", "免费额度", "升级套餐", "\"code\":40201",
 }
 
 // sessionDeadMarkers 龙虾刷新被拒的错误码（40100 / 40101 为终止性失败）。

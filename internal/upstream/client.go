@@ -2,6 +2,7 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
@@ -248,6 +249,10 @@ func prepareChatBody(rawBody []byte) []byte {
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、status 为上游状态码、err 为 nil（body 在 c.LastBody，
 // 调用方用 Classify(status, body) 判定）；只有传输层失败才返回 err。
+// ⚠️ 龙虾会把部分业务错误（如额度不足 code=40201）藏在 HTTP 200 的 SSE 流里
+//（event:error 帧），且帧在流首 → 对 200 响应先窥探首块，识别出错误帧就按
+// 非 2xx 同样路径处理（rc=nil + LastBody，由调用方 Classify），否则错误会
+// 假装成空 content 的正常响应穿透到客户端。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, err error) {
 	url := ServerBase() + "/api/proxy/v1/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepareChatBody(body)))
@@ -269,8 +274,49 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, nil
 	}
-	return resp.Body, resp.StatusCode, nil
+	// Peek 不消费：单次窥探后把同一个 bufio 交给下游，流首无损透传。
+	br := bufio.NewReaderSize(resp.Body, peekBufSize)
+	head, peekErr := br.Peek(peekBufSize)
+	if peekErr != nil && peekErr != io.EOF {
+		head = nil // 连接中途断开：按正常流放行，让下游读到半截时自行报传输错误
+	}
+	if len(head) > 0 && isSSEErrorFrame(head) {
+		resp.Body.Close()
+		c.LastBody = head
+		kind := Classify(resp.StatusCode, string(head))
+		log.Printf("chat_stream uid=%s: upstream 200-with-error %s body=%s",
+			a.UID, kind, truncate(string(head), 200))
+		return nil, resp.StatusCode, nil
+	}
+	return &peekCloser{r: br, c: resp.Body}, resp.StatusCode, nil
 }
+
+// peekBufSize 首块窥探窗口：错误帧总在流首（实测 <200 字节），正常响应
+// 首 4KB 内必有数据；不足 4KB 且流已结束（EOF）也照样能判。
+const peekBufSize = 4 << 10
+
+// isSSEErrorFrame 判定首块是否为龙虾 200 流内的错误帧：
+// `event:error` 行，或 data JSON 里带 error 对象 / 业务错误码。
+func isSSEErrorFrame(head []byte) bool {
+	s := string(head)
+	if strings.Contains(s, "event:error") || strings.Contains(s, "event: error") {
+		return true
+	}
+	if strings.Contains(s, "\"error\":{") || strings.Contains(s, "\"error\": {") {
+		return true
+	}
+	return false
+}
+
+// peekCloser：窥探用的 bufio.Reader + 原始 body 的关闭句柄。
+// Peek 只填充缓冲区、不消费字节，读同一 br 即从流首开始。
+type peekCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (p *peekCloser) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (p *peekCloser) Close() error               { return p.c.Close() }
 
 // FetchModels 调上游动态模型接口。
 // GET {server}/api/models/available，Bearer accessToken。

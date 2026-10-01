@@ -212,10 +212,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc, status, terr := h.cfg.Upstream.ChatStream(acct, body)
 		if terr != nil {
 			lastErr = terr
-			h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+			// 200 流内错误帧（额度不足等）也走冷却：按分类挑冷却强度，
+			// 没分类信息才退回普通 NoteError。
+			var ue *upstream.Error
+			if errors.As(terr, &ue) && ue.Kind == upstream.ErrHardCredit {
+				h.cfg.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额不足")
+			} else {
+				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+			}
 			continue
 		}
-		if status >= 400 {
+		if rc == nil {
+			// 非 2xx，或 200 但流首就是错误帧：统一用 LastBody 分类处置。
 			kind := upstream.Classify(status, string(h.cfg.Upstream.LastBody))
 			switch kind {
 			case upstream.ErrHardCredit:
