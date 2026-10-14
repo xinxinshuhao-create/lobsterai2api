@@ -80,6 +80,7 @@ type Pool struct {
 	mu      sync.RWMutex
 	byUID   map[string]*entry
 	stateFp string
+	cursor  int
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态。
@@ -122,32 +123,39 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 }
 
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
+// Pick 返回下一个可用账号（轮询）；无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.byUID)
+	if n == 0 {
+		return nil
+	}
+	uids := make([]string, 0, n)
+	for uid := range p.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
 	now := time.Now()
-	var best *entry
-	for uid, e := range p.byUID {
+	for k := 0; k < n; k++ {
+		idx := (p.cursor + k) % n
+		uid := uids[idx]
 		if tried != nil && tried[uid] {
 			continue
 		}
+		e := p.byUID[uid]
 		if !e.healthy(now) {
 			continue
 		}
-		if best == nil || e.credits > best.credits {
-			best = e
-		}
+		p.cursor = (idx + 1) % n
+		return e.a
 	}
-	if best == nil {
-		return nil
-	}
-	return best.a
+	return nil
 }
 
 // SetCredits 更新账号余额。

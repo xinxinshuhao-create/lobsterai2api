@@ -55,10 +55,15 @@ func main() {
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 	})
 
+	maxRotate := len(auths)
+	if maxRotate < 3 {
+		maxRotate = 3
+	}
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		MaxRotate:    maxRotate,
 		HardCooldown: cfg.HardCreditDur,
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,
